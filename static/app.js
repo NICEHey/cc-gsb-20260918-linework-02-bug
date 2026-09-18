@@ -74,17 +74,28 @@
 
   // ------------------------------------------------------------- 修复
 
+  var repairing = false;
   function runRepair() {
-    var r = workbench.repair();
-    if (!r.ok) {
-      showErrors(r.errors, '草稿无法通过校验，请先修正以下字段：');
-      return;
-    }
-    hideErrors();
-    if (selection && (selection.kind === 'node' || selection.kind === 'edge' || selection.kind === 'path')) {
-      selection = null;
-    }
-    renderAll();
+    if (repairing || workbench.repairing) return;
+    var btn = document.getElementById('btnRepair');
+    btn.disabled = true;
+    repairing = true;
+    btn.textContent = '修复中…';
+    // 走分批让出事件循环的同一引擎：大量重复/共点线段时页面仍可响应
+    workbench.repairAsync().then(function (r) {
+      repairing = false;
+      btn.disabled = false;
+      btn.textContent = '执行修复';
+      if (!r.ok) {
+        showErrors(r.errors, '草稿无法通过校验，请先修正以下字段：');
+        return;
+      }
+      hideErrors();
+      if (selection && (selection.kind === 'node' || selection.kind === 'edge' || selection.kind === 'path')) {
+        selection = null;
+      }
+      renderAll();
+    });
   }
 
   // ------------------------------------------------------------- 线段表
@@ -228,7 +239,11 @@
   function renderStatusBar() {
     var pill = document.getElementById('statusPill');
     var btnTopo = document.getElementById('btnExportTopo');
-    if (workbench.result && !workbench.stale) {
+    if (workbench.repairing) {
+      pill.textContent = '正在修复…';
+      pill.className = 'pill stale';
+      btnTopo.disabled = true;
+    } else if (workbench.result && !workbench.stale) {
       pill.textContent = '修复结果有效';
       pill.className = 'pill fresh';
       btnTopo.disabled = false;

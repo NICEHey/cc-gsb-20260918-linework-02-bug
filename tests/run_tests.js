@@ -17,12 +17,38 @@ var T = require('../static/topology.js');
 var WB = require('../static/workbench.js');
 var cases = require('../fixtures/cases.json').cases;
 
-var passed = 0, failed = 0;
+var passed = 0, failed = 0, pending = 0, finished = false;
+var failures = [];
 function test(name, fn) {
-  try { fn(); passed++; process.stdout.write('.'); }
+  pending++;
+  function settle() {
+    pending--;
+    if (finished && pending === 0) finish();
+  }
+  try {
+    if (fn.length >= 1) {
+      var done = function (err) {
+        if (err) {
+          failed++;
+          failures.push({ name: name, err: err });
+          process.stdout.write('\n✗ ' + name + ' (async)\n  ' +
+            (err && err.stack ? err.stack.split('\n').slice(0, 3).join('\n  ') : err) + '\n');
+        } else {
+          passed++; process.stdout.write('.');
+        }
+        settle();
+      };
+      fn(done);
+    } else {
+      fn(); passed++; process.stdout.write('.');
+      settle();
+    }
+  }
   catch (e) {
     failed++;
+    failures.push({ name: name, err: e });
     process.stdout.write('\n✗ ' + name + '\n  ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join('\n  ') : e) + '\n');
+    settle();
   }
 }
 function caseDraft(key, overrides) {
@@ -616,9 +642,337 @@ test('随机模糊：1000 个随机草稿全部无异常且图不变量成立', 
 
 
 
-process.stdout.write('\n');
-if (failed) {
-  console.log(failed + ' 个测试失败，' + passed + ' 个通过');
-  process.exit(1);
+// ---------------------------------------------------------- 12. 面积精度与平移/方向不变性
+
+test('小三角形在原点面积 0.000001（真实 0.0000005 半入）', function () {
+  var d = draft('tri0', 0, [
+    seg('a', 0, 0, 0.001, 0),
+    seg('b', 0.001, 0, 0, 0.001),
+    seg('c', 0, 0.001, 0, 0)
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.summary.rings, 1);
+  assert.strictEqual(r.paths[0].area, 0.000001);
+});
+
+test('BUG 回归：同一小三角形平移到 (1,1) 后面积仍为 0.000001', function () {
+  var d = draft('tri1', 0, [
+    seg('a', 1, 1, 1.001, 1),
+    seg('b', 1.001, 1, 1, 1.001),
+    seg('c', 1, 1.001, 1, 1)
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.paths[0].closed, true);
+  assert.strictEqual(r.paths[0].area, 0.000001);
+});
+
+test('面积平移不变：原点、(1,1)、(1000,-1000)、±(9999,9999) 完全一致', function () {
+  var offsets = [[0, 0], [1, 1], [1000, -1000], [9999, 9999], [-9999, -9999]];
+  var ref = null;
+  offsets.forEach(function (o) {
+    var d = draft('tri', 0, [
+      seg('a', o[0], o[1], o[0] + 0.001, o[1]),
+      seg('b', o[0] + 0.001, o[1], o[0], o[1] + 0.001),
+      seg('c', o[0], o[1] + 0.001, o[0], o[1])
+    ]);
+    var p = T.repair(d).paths[0];
+    if (ref === null) ref = { area: p.area, nodes: p.nodes, length: p.length };
+    assert.strictEqual(p.area, ref.area, 'offset ' + o + ' 面积变化');
+    assert.deepStrictEqual(p.nodes, ref.nodes, 'offset ' + o + ' 归一节点序列变化');
+    assert.strictEqual(p.length, ref.length, 'offset ' + o + ' 长度变化');
+  });
+});
+
+test('面积对输入顺序与端点方向不敏感：8 种排列/反向给出同一结果', function () {
+  function mk(reverse, order) {
+    var s = [
+      seg('a', 0, 0, 0.001, 0),
+      seg('b', 0.001, 0, 0, 0.001),
+      seg('c', 0, 0.001, 0, 0)
+    ];
+    if (reverse) s = s.map(function (g) { return seg(g.id, g.b.x, g.b.y, g.a.x, g.a.y); });
+    s.sort(function () { return order; });
+    return draft('tri', 0, s);
+  }
+  var ref = T.repair(mk(false, 0)).paths[0];
+  var r2 = T.repair(mk(true, 1)).paths[0];
+  var r3 = T.repair(mk(false, -1)).paths[0];
+  [r2, r3].forEach(function (p) {
+    assert.strictEqual(p.area, ref.area);
+    assert.deepStrictEqual(p.nodes, ref.nodes);
+  });
+});
+
+test('舍入边界 k=1：真实面积 <0.5e-6 正确舍入为 0，闭环仍保留且方向不翻转', function () {
+  var d = draft('b1', 0, [
+    seg('base', 0, 0, 0.001, 0),
+    seg('l1', 0, 0, 1, 2),
+    seg('l2', 0.001, 0, -1, 2)
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.summary.rings, 1);
+  var ring = r.paths.filter(function (p) { return p.closed; })[0];
+  assert.strictEqual(ring.area, 0);
+  assert.strictEqual(r.summary.openPaths, 2); // 交点环带两条支线
+  // 方向：从最小节点出发的输出坐标有向面积不得为负（CCW）
+  var twice = 0;
+  for (var i = 0; i + 1 < ring.nodes.length; i++) {
+    var a = r.nodes[ring.nodes[i]], b = r.nodes[ring.nodes[i + 1]];
+    twice += a.x * b.y - b.x * a.y;
+  }
+  assert.ok(twice >= -1e-12, '舍入为 0 的环方向被翻转');
+  // 仍从环内最小节点起步（节点 0 是支线端点，不属于环）
+  var ringMin = Math.min.apply(null, ring.nodes.slice(0, -1));
+  assert.strictEqual(ring.nodes[0], ringMin);
+});
+
+test('舍入边界 k=0.999 / 0.998：面积 0.000001，且平移到坐标上限附近不变', function () {
+  [[0, 0], [1, 1], [9998, 9998]].forEach(function (o) {
+    [0.999, 0.998].forEach(function (k) {
+      var d = draft('b', 0, [
+        seg('base', o[0], o[1], o[0] + 0.001, o[1]),
+        seg('l1', o[0], o[1], o[0] + 1, o[1] + 2),
+        seg('l2', o[0] + 0.001, o[1], o[0] - k, o[1] + 2)
+      ]);
+      var r = T.repair(d);
+      var ring = r.paths.filter(function (p) { return p.closed; })[0];
+      assert.ok(ring, 'offset ' + o + ' k=' + k + ' 闭环丢失');
+      assert.strictEqual(ring.area, 0.000001, 'offset ' + o + ' k=' + k);
+    });
+  });
+});
+
+test('交点构成的小环面积不随平移改变（负象限）', function () {
+  function mk(o) {
+    return draft('k', 0, [
+      seg('base', o[0], o[1], o[0] + 0.001, o[1]),
+      seg('l1', o[0], o[1], o[0] + 1, o[1] + 2),
+      seg('l2', o[0] + 0.001, o[1], o[0] - 0.998, o[1] + 2)
+    ]);
+  }
+  var a = T.repair(mk([0, 0])).paths.filter(function (p) { return p.closed; })[0];
+  var b = T.repair(mk([-7777, -8888])).paths.filter(function (p) { return p.closed; })[0];
+  assert.strictEqual(b.area, a.area);
+  assert.deepStrictEqual(b.nodes, a.nodes);
+});
+
+test('带支线的环平移到 (5000,5000)：面积 100、方向、环回分叉点不变', function () {
+  var o = [5000, 5000];
+  var d = draft('lollipop-far', 0, [
+    seg('bottom', o[0], o[1], o[0] + 10, o[1]),
+    seg('right', o[0] + 10, o[1], o[0] + 10, o[1] + 10),
+    seg('top', o[0] + 10, o[1] + 10, o[0], o[1] + 10),
+    seg('left', o[0], o[1] + 10, o[0], o[1]),
+    seg('tail', o[0] + 10, o[1] + 10, o[0] + 15, o[1] + 10)
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.summary.rings, 1);
+  assert.strictEqual(r.summary.openPaths, 1);
+  var ring = r.paths.filter(function (p) { return p.closed; })[0];
+  assert.strictEqual(ring.area, 100);
+  assert.strictEqual(ring.length, 40);
+  assert.strictEqual(ring.nodes[0], ring.nodes[ring.nodes.length - 1]);
+});
+
+// ---------------------------------------------------------- 13. 同点归一的传递闭包
+
+test('交点 ε 传递闭包：相邻 <=1e-9、跨度 >1e-9 的三个交点归一为同一节点', function () {
+  // 三斜线与横轴的交点（世界 x）：1/1000/1000=1e-9、1/(1001*1000)、1/(1002*1000)，
+  // 相邻距离约 0.999e-9（<=1e-9），首末相距约 1.996e-9（>1e-9）。
+  // 只取直接并集会得到两组，必须传递闭包才合并。
+  var d = draft('eps-chain', 0, [
+    seg('base', 0, 0, 0.01, 0),
+    seg('l1', 0, 0.001, 0.001, -0.999),
+    seg('l2', 0, 0.001, 0.001, -1),
+    seg('l3', 0, 0.001, 0.001, -1.001)
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.summary.nodes, 7);
+  assert.strictEqual(r.summary.edges, 6);
+  var j = r.nodes.filter(function (n) { return n.y === 0 && n.degree === 6; });
+  assert.strictEqual(j.length, 1, '三个近交点必须经传递闭包合并为一个度 6 节点');
+  assert.strictEqual(j[0].x, 0.000001); // 字典序最小代表
+});
+
+test('相距 2e-9 的两个交点不被误并（不做按小数位粗分桶）', function () {
+  var d = draft('eps-ctl', 0, [
+    seg('base', 0, 0, 0.01, 0),
+    seg('l1', 0, 0.001, 0.001, -0.999),     // 交 x = 1e-9
+    seg('l4', 0, 0.001, 0.003, -0.999)      // 交 x = 3e-9
+  ]);
+  var r = T.repair(d);
+  var js = r.nodes.filter(function (n) { return n.y === 0 && n.degree === 4; });
+  assert.strictEqual(js.length, 2);
+});
+
+// ---------------------------------------------------------- 14. 退化密集输入：正确性 + 性能
+
+function duplicateDraft(n) {
+  var segs = [];
+  for (var i = 0; i < n; i++) segs.push(seg('s' + i, 0, 0, 10, 0));
+  return draft('dup' + n, 0, segs);
 }
-console.log('全部 ' + passed + ' 个测试通过');
+function fanDraft(n) {
+  var segs = [];
+  for (var i = 0; i < n; i++) segs.push(seg('s' + i, -1000, -i, 1000, i));
+  return draft('fan' + n, 0, segs);
+}
+
+test('200 条完全重复线段：2 节点 / 1 边 / 1 开链，sources 保留全部 200 个 ID', function () {
+  var r = T.repair(duplicateDraft(200));
+  assert.strictEqual(r.summary.nodes, 2);
+  assert.strictEqual(r.summary.edges, 1);
+  assert.strictEqual(r.summary.openPaths, 1);
+  assert.strictEqual(r.summary.components, 1);
+  assert.strictEqual(r.edges[0].sources.length, 200);
+  assert.deepStrictEqual(r.edges[0].sources[0], 's0');
+  assert.deepStrictEqual(r.edges[0].sources[199], 's99');
+});
+
+test('200 条线段共点相交：401 节点 / 400 边 / 400 开链，每边恰好属于一条路径', function () {
+  var r = T.repair(fanDraft(200));
+  assert.strictEqual(r.summary.nodes, 401);
+  assert.strictEqual(r.summary.edges, 400);
+  assert.strictEqual(r.summary.openPaths, 400);
+  assert.strictEqual(r.summary.junctions, 1);
+  var owner = {};
+  r.paths.forEach(function (p) {
+    p.edges.forEach(function (e) { assert.ok(!owner[e]); owner[e] = 1; });
+  });
+  assert.strictEqual(Object.keys(owner).length, 400);
+});
+
+test('反向重复 + 部分重叠 + 交叉混合：节点/边/来源准确', function () {
+  var d = draft('mix-overlap', 0, [
+    seg('fwd', 0, 0, 10, 0),
+    seg('rev', 10, 0, 0, 0),       // 整条反向重复
+    seg('mid', 2, 0, 8, 0),        // 中间部分重叠
+    seg('vert', 5, -3, 5, 3)       // 在中点与三条横轴交叉
+  ]);
+  var r = T.repair(d);
+  assert.strictEqual(r.summary.nodes, 7);
+  assert.strictEqual(r.summary.edges, 6);
+  var byEndpoints = r.edges.map(function (e) {
+    return [r.nodes[e.from].x, r.nodes[e.to].x, e.sources];
+  });
+  // (0)-(2) 与 (8)-(10)：仅 fwd/rev；(2)-(5) 与 (5)-(8)：fwd/mid/rev
+  var seg02 = byEndpoints.filter(function (e) { return e[0] === 0 && e[1] === 2; })[0];
+  var seg25 = byEndpoints.filter(function (e) { return e[0] === 2 && e[1] === 5; })[0];
+  var seg58 = byEndpoints.filter(function (e) { return e[0] === 5 && e[1] === 8; })[0];
+  var seg810 = byEndpoints.filter(function (e) { return e[0] === 8 && e[1] === 10; })[0];
+  assert.deepStrictEqual(seg02[2], ['fwd', 'rev']);
+  assert.deepStrictEqual(seg25[2], ['fwd', 'mid', 'rev']);
+  assert.deepStrictEqual(seg58[2], ['fwd', 'mid', 'rev']);
+  assert.deepStrictEqual(seg810[2], ['fwd', 'rev']);
+  var center = r.nodes.filter(function (n) { return n.x === 5 && n.y === 0; })[0];
+  assert.strictEqual(center.degree, 4); // 横轴左右 + 垂线上下；重复段不增加度
+  // 每条边恰好一条路径
+  var owner = {};
+  r.paths.forEach(function (p) { p.edges.forEach(function (e) {
+    assert.ok(!owner[e]); owner[e] = 1;
+  }); });
+  assert.strictEqual(Object.keys(owner).length, r.summary.edges);
+});
+
+test('重复段与正常交叉混合：横轴两半各保留 100 个来源，三线共点度 6', function () {
+  var segs = [];
+  for (var i = 0; i < 100; i++) segs.push(seg('d' + i, 0, 0, 10, 0));
+  segs.push(seg('vert', 5, -5, 5, 5));
+  segs.push(seg('diag', 0, 5, 10, -5)); // 与横轴、垂线三线共点于 (5,0)
+  var r = T.repair(draft('mix100', 0, segs));
+  assert.strictEqual(r.summary.nodes, 7);
+  var left = r.edges.filter(function (e) {
+    return r.nodes[e.from].x === 0 && r.nodes[e.to].x === 5 &&
+           r.nodes[e.from].y === 0 && r.nodes[e.to].y === 0;
+  })[0];
+  var right = r.edges.filter(function (e) {
+    return r.nodes[e.from].x === 5 && r.nodes[e.to].x === 10 &&
+           r.nodes[e.from].y === 0 && r.nodes[e.to].y === 0;
+  })[0];
+  assert.strictEqual(left.sources.length, 100);
+  assert.strictEqual(right.sources.length, 100);
+  var center = r.nodes.filter(function (n) { return n.x === 5 && n.y === 0; })[0];
+  assert.strictEqual(center.degree, 6);
+});
+
+test('性能回归：200 条与 80 条完整输入中位数之比 <= 12', function () {
+  function med(fn, reps) {
+    fn();
+    var ts = [];
+    for (var k = 0; k < reps; k++) {
+      var t0 = process.hrtime.bigint();
+      fn();
+      ts.push(Number(process.hrtime.bigint() - t0) / 1e6);
+    }
+    ts.sort(function (a, b) { return a - b; });
+    return ts[Math.floor(reps / 2)];
+  }
+  var m80 = med(function () { T.repair(duplicateDraft(80)); }, 7);
+  var m200 = med(function () { T.repair(duplicateDraft(200)); }, 7);
+  var f80 = med(function () { T.repair(fanDraft(80)); }, 7);
+  var f200 = med(function () { T.repair(fanDraft(200)); }, 7);
+  console.log('\n  [perf] dup 80=' + m80.toFixed(2) + 'ms 200=' + m200.toFixed(2) +
+    'ms 比例=' + (m200 / m80).toFixed(2) +
+    '；fan 80=' + f80.toFixed(2) + 'ms 200=' + f200.toFixed(2) +
+    'ms 比例=' + (f200 / f80).toFixed(2));
+  assert.ok(m200 / m80 <= 12, '重复输入 200/80 耗时比 ' + (m200 / m80).toFixed(2) + ' > 12');
+  assert.ok(f200 / f80 <= 12, '共点输入 200/80 耗时比 ' + (f200 / f80).toFixed(2) + ' > 12');
+});
+
+// ---------------------------------------------------------- 15. 异步修复（页面不卡死的同一引擎）
+
+test('repairAsync：与同步 repair 给出同一份结果', function (done) {
+  var d = duplicateDraft(200);
+  T.repairAsync(d).then(function (r) {
+    try {
+      var sync = T.repair(d);
+      assert.strictEqual(r.summary.nodes, sync.summary.nodes);
+      assert.strictEqual(r.edges[0].sources.length, 200);
+      assert.strictEqual(r.paths[0].area, sync.paths[0].area);
+      done();
+    } catch (e) { done(e); }
+  });
+});
+
+test('repairAsync 修复期间草稿被编辑：到达的旧结果被丢弃，仍标记过期', function (done) {
+  var WB2 = require('../static/workbench.js');
+  var wb = WB2.create(duplicateDraft(200));
+  var p = wb.repairAsync();
+  wb.setSnapDistance(0.1); // 修复进行中编辑
+  p.then(function () {
+    try {
+      assert.strictEqual(wb.stale, true);
+      assert.strictEqual(wb.exportTopology(), null);
+      assert.strictEqual(wb.repairing, false);
+      done();
+    } catch (e) { done(e); }
+  });
+});
+
+test('repairAsync 期间不允许并发第二次修复', function (done) {
+  var WB2 = require('../static/workbench.js');
+  var wb = WB2.create(duplicateDraft(200));
+  var p1 = wb.repairAsync();
+  var p2 = wb.repairAsync();
+  p2.then(function (r) {
+    try {
+      assert.strictEqual(r.ok, false);
+      p1.then(function (r1) {
+        try { assert.strictEqual(r1.ok, true); assert.strictEqual(wb.stale, false); done(); }
+        catch (e) { done(e); }
+      });
+    } catch (e) { done(e); }
+  });
+});
+
+process.stdout.write('\n');
+finished = true;
+if (pending === 0) finish();
+
+function finish() {
+  if (failed) {
+    console.log(failed + ' 个测试失败，' + passed + ' 个通过');
+    process.exit(1);
+  }
+  console.log('全部 ' + passed + ' 个测试通过');
+}

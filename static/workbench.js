@@ -26,12 +26,16 @@
       stale: false,
       undoStack: [],
       redoStack: [],
-      _listeners: []
+      _listeners: [],
+      _draftVersion: 0,
+      _repairing: false
     };
 
     function emit() {
       wb._listeners.forEach(function (fn) { fn(wb); });
     }
+
+    function bumpVersion() { wb._draftVersion++; }
 
     function segIndex(id) {
       for (var i = 0; i < wb.draft.segments.length; i++) {
@@ -47,6 +51,7 @@
       wb.redoStack = [];
       mutator();
       wb.stale = true;
+      bumpVersion();
       emit();
     }
 
@@ -54,6 +59,7 @@
       pushCurrentTo.push(deepClone(wb.draft));
       wb.draft = snap;
       wb.stale = true;
+      bumpVersion();
       emit();
     }
 
@@ -65,6 +71,7 @@
       get canUndo() { return wb.undoStack.length > 0; },
       get canRedo() { return wb.redoStack.length > 0; },
       get undoDepth() { return wb.undoStack.length; },
+      get repairing() { return wb._repairing; },
 
       undo: function () {
         if (!wb.undoStack.length) return;
@@ -157,6 +164,31 @@
         wb.stale = false;
         emit();
         return { ok: true, result: wb.result };
+      },
+
+      // 浏览器用：与 repair() 同一份引擎、同一份结果，只在成对求交循环中
+      // 分批让出事件循环，避免大量线段时长时间卡死页面。
+      // 修复期间若草稿被修改，到达的旧结果直接丢弃（旧结果失效规则不变）。
+      repairAsync: function () {
+        var v = Topology.validateDraft(wb.draft);
+        if (!v.ok) return Promise.resolve({ ok: false, errors: v.errors });
+        if (wb._repairing) return Promise.resolve({ ok: false, errors: [{ path: '$', message: '修复正在进行中' }] });
+        var snapshot = deepClone(wb.draft);
+        var version = wb._draftVersion;
+        wb._repairing = true;
+        emit();
+        return Topology.repairAsync(snapshot).then(function (result) {
+          wb._repairing = false;
+          // 期间草稿发生过编辑（版本号变化）：结果对应旧草稿，丢弃
+          if (version !== wb._draftVersion) {
+            emit();
+            return { ok: true, result: wb.result, stale: true };
+          }
+          wb.result = result;
+          wb.stale = false;
+          emit();
+          return { ok: true, result: result };
+        });
       },
 
       // 只有与当前草稿一致的修复结果才允许导出
