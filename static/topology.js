@@ -9,12 +9,14 @@
  *   2. 对剩余启用线段的端点建吸附关系（dist <= snapDistance + 1e-9），
  *      取传递闭包；每组统一移到组内按 (x,y) 字典序最小的“原端点”
  *   3. 报告吸附后退化的线段并从交点阶段排除
- *   4. 在吸附后线段上求全部交点（端点落内部 / 十字交叉 / 共线重叠端点）
- *   5. 收集全部端点与交点，按欧氏距离 <= 1e-9 取传递闭包并归并
+ *   4. 在吸附后线段上求全部交点（端点落内部 / 十字交叉 / 共线重叠端点），
+ *      端点与交点都带千分之一整数 BigInt 精确有理表示
+ *   5. 收集全部端点与交点：相同点 O(1) 精确去重；再对“互不相同的点”
+ *      按欧氏距离 <= 1e-9 取传递闭包（距离判定亦精确），字典序最小代表
  *   6. 按归并点切分小边；完全重合的小边只留一份，记录全部来源原始 ID
  *   7. 构图、统计、提取最大连续链（开链/闭环），闭环按最小编号起点 +
- *      笛卡尔逆时针归一并计算面积
- *   8. 稳定排序、编号、六位小数输出
+ *      笛卡尔逆时针归一；面积用 BigInt 精确鞋带公式累加
+ *   8. 稳定排序、编号、最后一步六位小数四舍五入输出
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
@@ -82,6 +84,244 @@
     // 避免 -0
     var r = Math.round(v * 1e6) / 1e6;
     return r === 0 ? 0 : r;
+  }
+
+  // ---------------------------------------------------------------- 精确有理数
+  //
+  // 输入坐标至多三位小数：端点的“千分之一整数”坐标是精确整数。
+  // 两条线段的交点参数是整数比，交点的千分之一坐标是整数/整数有理数。
+  // 面积对大坐标附近的微小环极度敏感（平移后 1e-7 量级面积会被浮点噪声
+  // 推过六位舍入边界），所以面积全程用 BigInt 精确累加，最后一步才舍入。
+
+  function gcdBig(a, b) {
+    a = a < 0n ? -a : a;
+    b = b < 0n ? -b : b;
+    while (b) { var t = a % b; a = b; b = t; }
+    return a;
+  }
+
+  // 精确点：实际坐标 = (xn/(1000*d), yn/(1000*d))，d 恒为正；
+  // xn、yn、d 已约去公因子。null 表示只有浮点近似（非三位小数兜底路径）。
+  function exactPoint(xn, yn, d) {
+    if (d < 0n) { xn = -xn; yn = -yn; d = -d; }
+    var g = gcdBig(gcdBig(xn, yn), d);
+    if (g > 1n) { xn /= g; yn /= g; d /= g; }
+    return { xn: xn, yn: yn, d: d };
+  }
+
+  function exactFromMilli(px, py) {
+    // 三位小数坐标 -> 千分之一整数
+    var ix = asInt1000(px), iy = asInt1000(py);
+    if (ix === null || iy === null) return null;
+    return { xn: BigInt(ix), yn: BigInt(iy), d: 1n };
+  }
+
+  // 精确点对应的最佳浮点近似（一次除法，不夹带浮点求交误差）
+  function exactX(p) { return Number(p.exact.xn) / Number(p.exact.d) / 1000; }
+  function exactY(p) { return Number(p.exact.yn) / Number(p.exact.d) / 1000; }
+  function pointX(p) { return p.exact ? exactX(p) : p.x; }
+  function pointY(p) { return p.exact ? exactY(p) : p.y; }
+
+  // 两点距离：有精确表示时坐标差由 BigInt 算出再做一次浮点转换，
+  // 避免“两个相近的大坐标浮点相减”造成的有效位损失（大坐标附近的短边）
+  function pointDist(p, q) {
+    if (p.exact && q.exact) {
+      var den = 1000n * p.exact.d * q.exact.d;
+      var dxN = p.exact.xn * q.exact.d - q.exact.xn * p.exact.d;
+      var dyN = p.exact.yn * q.exact.d - q.exact.yn * p.exact.d;
+      var fden = Number(den);
+      return Math.hypot(Number(dxN) / fden, Number(dyN) / fden);
+    }
+    return dist(p.x, p.y, q.x, q.y);
+  }
+
+  // 六位小数四舍五入；axis 取 'x'/'y'，有精确表示时走精确除法。
+  // 进位规则与旧实现 Math.round 一致：半值朝 +∞（-0.5→-0→0），
+  // 即 floor(v + 1/2)，不做 away-from-zero。
+  function round6Coord(p, axis) {
+    if (!p.exact) return round6(axis === 'y' ? p.y : p.x);
+    var e = p.exact;
+    var num = (axis === 'y' ? e.yn : e.xn) * 1000n, den = e.d; // coord*1e6
+    // floor(num/den + 1/2) = floor((2*num + den)/(2*den))，负数需真 floor
+    var units = floorDiv(num * 2n + den, den * 2n);
+    var r = Number(units) / 1e6;
+    return r === 0 ? 0 : r;
+  }
+
+  /*
+   * 精确有向面积累加器：Σ (x1*y2 - x2*y1)（未除 2）。
+   * 逐项并入并约分，公分母按 LCM 增长——整数求交的分母大量共因，
+   * 实际位数很小，且不引入任何浮点噪声。任一点缺精确表示即放弃，
+   * 由调用方走浮点兜底。
+   */
+  function ExactTwiceArea() { this.n = 0n; this.d = 1n; this.failed = false; }
+  ExactTwiceArea.prototype.addEdge = function (p, q) {
+    if (this.failed || !p.exact || !q.exact) { this.failed = true; return; }
+    var e1 = p.exact, e2 = q.exact;
+    var num = e1.xn * e2.yn - e2.xn * e1.yn;
+    var den = 1000000n * e1.d * e2.d; // (1000*d1)*(1000*d2)，恒正
+    var g0 = gcdBig(this.d, den);
+    var lcm = (this.d / g0) * den;
+    this.n = this.n * (lcm / this.d) + num * (lcm / den);
+    this.d = lcm;
+    if (this.n !== 0n) {
+      var g = gcdBig(this.n < 0n ? -this.n : this.n, this.d);
+      if (g > 1n) { this.n /= g; this.d /= g; }
+    } else {
+      this.d = 1n;
+    }
+  };
+  ExactTwiceArea.prototype.ring = function (nodeSeq, nodesArr) {
+    for (var i = 0; i + 1 < nodeSeq.length; i++) {
+      this.addEdge(nodesArr[nodeSeq[i]], nodesArr[nodeSeq[i + 1]]);
+    }
+    return this.failed ? null : this;
+  };
+  ExactTwiceArea.prototype.sign = function () {
+    return this.n < 0n ? -1 : this.n > 0n ? 1 : 0;
+  };
+  // area = |n|/(2d)，结果 *1e6 后四舍五入（半远离零），输出 /1e6
+  ExactTwiceArea.prototype.roundArea6 = function () {
+    var num = this.n < 0n ? -this.n : this.n;
+    // floor( num*1e6/(2d) + 1/2 ) = floor( (num*1e6 + d) / (2d) )
+    var units = (num * 1000000n + this.d) / (this.d * 2n);
+    var r = Number(units) / 1e6;
+    return r === 0 ? 0 : r;
+  };
+
+  function exactRingArea(nodeSeq, nodesArr) {
+    return new ExactTwiceArea().ring(nodeSeq, nodesArr);
+  }
+
+  // ---------------------------------------------------------------- 点索引
+  //
+  // 两层归一，保证“重复交点 O(1)，不同但 <=1e-9 的点仍取传递闭包”：
+  //   1) 精确恒等：收集阶段，数学上同一点（重复端点、各对线段以整数
+  //      算出的同一交点）共享同一个 BigInt 有理键，直接返回既有成员，
+  //      不产生任何邻域扫描——重复/共点线段不再退化为近四次方。
+  //   2) 邻近闭包：收集完成后，只在“互不相同的精确点”之间做一次网格
+  //      邻域扫描，距离 <= EPS 即 union，并查集保证传递闭包完整；
+  //      不按小数位分桶，不同节点不会被粗桶错误混并。
+  function PointIndex() {
+    this.members = [];  // {x,y,exact,cx,cy}，每个都是不同精确点
+    this.parent = [];
+    this.cells = new Map(); // "cx,cy" -> [memberIndex...]
+    this.exactId = new Map(); // "xn/yn/d" -> memberIndex
+  }
+  PointIndex.prototype._find = function (x) {
+    var root = x;
+    while (this.parent[root] !== root) root = this.parent[root];
+    while (this.parent[x] !== x) { var nx = this.parent[x]; this.parent[x] = root; x = nx; }
+    return root;
+  };
+  PointIndex.prototype.add = function (x, y, exact) {
+    if (exact) {
+      var key = exact.xn + '/' + exact.yn + '/' + exact.d;
+      var hit = this.exactId.get(key);
+      if (hit !== undefined) return hit; // 同一点：O(1)，无扫描
+    }
+    // 桶号用精确有理数计算 floor(coord/1e-9)=floor(coord*1e6)：
+    // 世界坐标 xn/(1000d) ×1e9 = xn*1e6/d，整除即得，无浮点越界风险
+    var cx, cy;
+    if (exact) {
+      cx = floorDiv(exact.xn * 1000000n, exact.d);
+      cy = floorDiv(exact.yn * 1000000n, exact.d);
+    } else {
+      cx = Math.floor(x / EPS);
+      cy = Math.floor(y / EPS);
+    }
+    var id = this.members.length;
+    this.members.push({ x: x, y: y, exact: exact, cx: Number(cx), cy: Number(cy) });
+    this.parent.push(id);
+    if (exact) this.exactId.set(key, id);
+    var ck = cx + ',' + cy;
+    var bucket = this.cells.get(ck);
+    if (!bucket) { bucket = []; this.cells.set(ck, bucket); }
+    bucket.push(id);
+    return id;
+  };
+  function floorDiv(a, b) { // b>0
+    var q = a / b;
+    if (a < 0n && a % b !== 0n) q -= 1n;
+    return q;
+  }
+  // 在不同精确点之间做一次邻近闭包（距离恰为一格时可能相隔两个桶，扫 ±2）
+  PointIndex.prototype.mergeNearby = function () {
+    for (var id = 0; id < this.members.length; id++) {
+      var m = this.members[id];
+      for (var gx = m.cx - 2; gx <= m.cx + 2; gx++) {
+        for (var gy = m.cy - 2; gy <= m.cy + 2; gy++) {
+          var bucket = this.cells.get(gx + ',' + gy);
+          if (!bucket) continue;
+          for (var bi = 0; bi < bucket.length; bi++) {
+            var j = bucket[bi];
+            if (j <= id) continue; // 每对点只比一次
+            var o = this.members[j];
+            if (pointsWithinEPS(m, o)) {
+              var r1 = this._find(id), r2 = this._find(j);
+              if (r1 !== r2) this.parent[r2] = r1;
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // 欧氏距离 <= 1e-9：两点都有精确表示时按有理数精确判定，无浮点边界歧义。
+  // 世界坐标差 dx = Xn/den，den=1000*d1*d2；
+  // dx²+dy² <= 1e-18  <=>  (Xn²+Yn²) * 10^18 <= den²。
+  function pointsWithinEPS(m, o) {
+    if (m.exact && o.exact) {
+      var e1 = m.exact, e2 = o.exact;
+      var Xn = e1.xn * e2.d - e2.xn * e1.d;
+      var Yn = e1.yn * e2.d - e2.yn * e1.d;
+      var den = 1000n * e1.d * e2.d;
+      var lhs = (Xn * Xn + Yn * Yn) * 1000000000000000000n;
+      return lhs <= den * den;
+    }
+    var dx = o.x - m.x, dy = o.y - m.y;
+    return dx * dx + dy * dy <= EPS * EPS;
+  }
+  /*
+   * 冻结索引：每个成员 id 映射到它所属簇的同一个代表点对象
+   * {x,y,exact}。簇坐标取组内按 (x,y) 字典序最小的成员；最小成员无
+   * 精确表示时借用组内任一精确表示（同点的不同表示数学上相等）。
+   */
+  PointIndex.prototype.finalize = function () {
+    var self = this;
+    var groups = new Map();
+    for (var id = 0; id < this.members.length; id++) {
+      var root = this._find(id);
+      var g = groups.get(root);
+      if (!g) { g = { best: root, memberIds: [] }; groups.set(root, g); }
+      g.memberIds.push(id);
+      if (pointLexLess(this.members[id], this.members[g.best])) g.best = id;
+    }
+    var canon = new Array(this.members.length);
+    groups.forEach(function (g) {
+      var bm = self.members[g.best];
+      var point = { x: bm.x, y: bm.y, exact: bm.exact };
+      if (!point.exact) {
+        // 字典序最小成员无精确表示时，借用组内任一精确表示（数学上同点）
+        for (var j = 0; j < g.memberIds.length; j++) {
+          var ex = self.members[g.memberIds[j]].exact;
+          if (ex) { point.exact = ex; break; }
+        }
+      }
+      for (var k = 0; k < g.memberIds.length; k++) canon[g.memberIds[k]] = point;
+    });
+    return canon;
+  };
+
+  // 点的 (x,y) 字典序比较：有精确表示时按有理数精确比较
+  function pointLexLess(p, q) {
+    if (p.exact && q.exact) {
+      var cx = p.exact.xn * q.exact.d - q.exact.xn * p.exact.d;
+      if (cx !== 0n) return cx < 0n;
+      var cy = p.exact.yn * q.exact.d - q.exact.yn * p.exact.d;
+      return cy < 0n;
+    }
+    return lexLess(p, q);
   }
 
   // ---------------------------------------------------------------- 草稿校验
@@ -311,44 +551,32 @@
       });
     }
 
+    // 幸存线段的端点取自三位小数原端点，带上精确千分之一整数表示
+    survivors.forEach(function (sgm) {
+      sgm.exA = exactFromMilli(sgm.a.x, sgm.a.y);
+      sgm.exB = exactFromMilli(sgm.b.x, sgm.b.y);
+    });
+
     // 4 & 5. 收集端点与全部交点；1e-9 同点归并（传递闭包 + 网格哈希）
-    var pts = [];
-    var dsuP = new DSU(0);
-    var GRID = Math.max(EPS, 1e-9);
-    var cellBuckets = Object.create(null); // 网格桶，存点索引
-    function cellKey(cx, cy) { return cx + ':' + cy; }
-    function addPoint(p) {
-      var cx = Math.floor(p.x / GRID), cy = Math.floor(p.y / GRID);
-      // 始终建点并与所有距离 <= EPS 的旧点 union，保证传递闭包不丢链。
-      // 距离恰为一格时两点可能相隔两个桶，故扫描 ±2 邻域。
-      var idx = dsuP.add();
-      pts.push({ x: p.x, y: p.y });
-      for (var gx = cx - 2; gx <= cx + 2; gx++) {
-        for (var gy = cy - 2; gy <= cy + 2; gy++) {
-          var bucket = cellBuckets[cellKey(gx, gy)];
-          if (!bucket) continue;
-          for (var bi = 0; bi < bucket.length; bi++) {
-            var j = bucket[bi];
-            if (dist2(pts[j].x, pts[j].y, p.x, p.y) <= EPS * EPS) dsuP.union(idx, j);
-          }
-        }
-      }
-      var key = cellKey(cx, cy);
-      if (!cellBuckets[key]) cellBuckets[key] = [];
-      cellBuckets[key].push(idx);
-      return idx;
-    }
+    //
+    // 第一层：精确恒等。数学上同一点（重复端点、各对线段以整数算出的
+    // 同一交点）直接共享同一个 BigInt 键，O(1) 合并，不产生扫描负担——
+    // 这是消除“重复/共点交点近四次方”的关键，且不跳过任何一对线段。
+    // 第二层：不同但欧氏距离 <= EPS 的精确点进网格桶，逐对 union；
+    // 桶中每个点都是不同的精确点（端点间距至少 1e-3，交点由整数求交
+    // 得到），扫描量与“真实不同点数”成正比，仍保证传递闭包完整。
+    var index = new PointIndex();
+    function addPoint(p) { return index.add(p.x, p.y, p.exact || null); }
 
     var segPointIds = []; // 每条幸存线段上挂的点索引（端点 + 与之相关的全部交点）
     for (var ss = 0; ss < survivors.length; ss++) {
-      var iA = addPoint(survivors[ss].a);
-      var iB = addPoint(survivors[ss].b);
+      var iA = addPoint({ x: survivors[ss].a.x, y: survivors[ss].a.y, exact: survivors[ss].exA });
+      var iB = addPoint({ x: survivors[ss].b.x, y: survivors[ss].b.y, exact: survivors[ss].exB });
       segPointIds.push([iA, iB]);
     }
 
     // 逐对线段求交点（含 T 接、十字、共线重叠段的端点）。
-    // 分类由整数谓词精确给出，交点直接挂到两条线段上，
-    // 不再做事后“点在线上”复检（近平行时浮点交点可能偏离直线 >1e-9）。
+    // 分类与交点位置均由千分之一整数（BigInt）精确给出。
     for (var u = 0; u < survivors.length; u++) {
       for (var v = u + 1; v < survivors.length; v++) {
         var xs = segmentIntersections(survivors[u], survivors[v]);
@@ -360,27 +588,17 @@
       }
     }
 
-    var pg = Object.create(null);
-    var canonReady = false;
-    function buildCanon() {
-      // 单次遍历：每个并查集根取组内字典序最小的点
-      for (var k = 0; k < pts.length; k++) {
-        var root = dsuP.find(k);
-        var cur = pg[root];
-        if (!cur || lexLess(pts[k], cur)) pg[root] = pts[k];
-      }
-      canonReady = true;
-    }
-    function canon(pi) {
-      if (!canonReady) buildCanon();
-      return pg[dsuP.find(pi)];
-    }
+    // 冻结前：不同精确点之间做一次邻近闭包（<=1e-9 传递闭包，固定阈值）
+    index.mergeNearby();
+    // 冻结：成员 id -> 簇代表点 {x,y,exact}；组内取字典序最小（精确比较）
+    var canonById = index.finalize();
+    function canon(pi) { return canonById[pi]; }
 
-    // 6. 切分小边：每条幸存线段只取挂在它上面的归并点，按参数排序
-    var edgeMap = Object.create(null); // "x,y|x,y"（排序后）-> {a,b,sourceSet}
+    // 6. 切分小边：每条幸存线段只取挂在它上面的归并点，按精确参数排序
+    var edgeMap = Object.create(null); // "key|key"（端点排序后）-> {a,b,sourceSet}
     function pointKey(p) {
-      // 用内部精度坐标构造键；同一点已由 DSU 归并为同一对象
-      return p.x + ',' + p.y;
+      // 同一点已归一为同一对象；优先用精确有理键，浮点兜底用坐标字符串
+      return p.exact ? p.exact.xn + '/' + p.exact.yn + '/' + p.exact.d : p.x + ',' + p.y;
     }
     function orderedPair(p, q) {
       var kp = pointKey(p), kq = pointKey(q);
@@ -395,13 +613,35 @@
         var key = pointKey(cp);
         if (!seenOn[key]) { seenOn[key] = 1; onSeg.push(cp); }
       }
-      var ax = S.a.x, ay = S.a.y, dx = S.b.x - S.a.x, dy = S.b.y - S.a.y;
-      var len2 = dx * dx + dy * dy;
-      onSeg.sort(function (r, t) {
-        var pr = ((r.x - ax) * dx + (r.y - ay) * dy) / len2;
-        var pt = ((t.x - ax) * dx + (t.y - ay) * dy) / len2;
-        return pr - pt;
-      });
+      // 沿线段参数排序：t = (X-A)·R / |R|²，有精确表示时用 BigInt 精确比较
+      var Pm = S.exA, Rm = Pm && S.exB ? {
+        x: S.exB.xn - S.exA.xn,
+        y: S.exB.yn - S.exA.yn
+      } : null;
+      var ddd = Rm ? Rm.x * Rm.x + Rm.y * Rm.y : 0;
+      function tParam(p) {
+        // 点的千分之一坐标 = xn/d；t 分子 = (xn - P.x*d)*R.x + (yn-P.y*d)*R.y
+        var e = p.exact;
+        return {
+          n: (e.xn - Pm.xn * e.d) * Rm.x + (e.yn - Pm.yn * e.d) * Rm.y,
+          d: e.d * ddd
+        };
+      }
+      if (Rm && onSeg.every(function (p) { return !!p.exact; })) {
+        onSeg.sort(function (r, t) {
+          var a = tParam(r), b = tParam(t);
+          var lhs = a.n * b.d, rhs = b.n * a.d; // a.d,b.d 恒正
+          return lhs < rhs ? -1 : lhs > rhs ? 1 : 0;
+        });
+      } else {
+        var ax = S.a.x, ay = S.a.y, dx = S.b.x - S.a.x, dy = S.b.y - S.a.y;
+        var len2 = dx * dx + dy * dy;
+        onSeg.sort(function (r, t) {
+          var pr = ((pointX(r) - ax) * dx + (pointY(r) - ay) * dy) / len2;
+          var pt = ((pointX(t) - ax) * dx + (pointY(t) - ay) * dy) / len2;
+          return pr - pt;
+        });
+      }
       for (var kk = 0; kk + 1 < onSeg.length; kk++) {
         var u1 = onSeg[kk], u2 = onSeg[kk + 1];
         if (pointsEqual(u1, u2)) continue; // 归一后两端相同的小边忽略
@@ -415,17 +655,29 @@
     var rawEdges = Object.keys(edgeMap).map(function (k) {
       var e = edgeMap[k];
       var sources = Object.keys(e.sources).sort(unicodeCmp);
-      return { a: e.a, b: e.b, sources: sources, length: dist(e.a.x, e.a.y, e.b.x, e.b.y) };
+      return {
+        a: e.a, b: e.b, sources: sources,
+        length: pointDist(e.a, e.b)
+      };
     });
 
-    // 7. 唯一节点：按 (x,y) 排序编号
+    // 7. 唯一节点：按 (x,y) 字典序排序编号（精确有理比较，浮点兜底）
     var nodeMap = Object.create(null);
     var nodesArr = [];
     rawEdges.forEach(function (e) { [e.a, e.b].forEach(function (p) {
       var k = pointKey(p);
       if (!nodeMap[k]) { nodeMap[k] = p; nodesArr.push(p); }
     }); });
-    nodesArr.sort(function (p, q) { return lexLess(p, q) ? -1 : lexLess(q, p) ? 1 : 0; });
+    nodesArr.sort(function (p, q) {
+      if (p.exact && q.exact) {
+        var cx = p.exact.xn * q.exact.d - q.exact.xn * p.exact.d;
+        if (cx !== 0n) return cx < 0n ? -1 : 1;
+        var cy = p.exact.yn * q.exact.d - q.exact.yn * p.exact.d;
+        if (cy !== 0n) return cy < 0n ? -1 : 1;
+        return 0;
+      }
+      return lexLess(p, q) ? -1 : lexLess(q, p) ? 1 : 0;
+    });
     var nodeId = Object.create(null);
     nodesArr.forEach(function (p, idx) { nodeId[pointKey(p)] = idx; });
 
@@ -463,7 +715,7 @@
 
     // 输出数值：长度/面积先按内部精度计算，最后统一六位小数
     var outNodes = nodesArr.map(function (p, idx) {
-      return { id: idx, x: round6(p.x), y: round6(p.y), degree: adj[idx].length };
+      return { id: idx, x: round6Coord(p, 'x'), y: round6Coord(p, 'y'), degree: adj[idx].length };
     });
     var outEdges = edgesArr.map(function (e, idx) {
       return { id: idx, from: e.from, to: e.to, sources: e.sources.slice(), length: round6(e.length) };
@@ -473,8 +725,7 @@
       pth.edges.forEach(function (eid) { edgesArr[eid].sources.forEach(function (s) { srcSet[s] = 1; }); });
       var length = 0;
       for (var li = 0; li + 1 < pth.nodes.length; li++) {
-        length += dist(nodesArr[pth.nodes[li]].x, nodesArr[pth.nodes[li]].y,
-                       nodesArr[pth.nodes[li + 1]].x, nodesArr[pth.nodes[li + 1]].y);
+        length += pointDist(nodesArr[pth.nodes[li]], nodesArr[pth.nodes[li + 1]]);
       }
       var out = {
         id: idx,
@@ -485,7 +736,11 @@
         area: null,
         sources: Object.keys(srcSet).sort(unicodeCmp)
       };
-      if (pth.closed) out.area = round6(Math.abs(signedArea(pth.nodes, nodesArr)));
+      if (pth.closed) {
+        // 面积：BigInt 精确鞋带公式，最后一步才舍入；无法精确时浮点兜底
+        var exact = exactRingArea(pth.nodes, nodesArr);
+        out.area = exact ? exact.roundArea6() : round6(Math.abs(signedArea(pth.nodes, nodesArr)));
+      }
       return out;
     });
 
@@ -528,69 +783,98 @@
     return Math.abs(k - r) <= 1e-6 ? r : null;
   }
 
-  // 两线段的全部交点（含端点接触、T 接；共线时返回重叠区间端点）
+  // 两线段的全部交点（含端点接触、T 接；共线时返回重叠区间端点）。
+  // 吸附后端点均为三位小数：千分之一坐标是整数，分类谓词与交点位置
+  // 全部用 BigInt 精确计算，交点携带 {x,y,exact:{xn,yn,d}}。
   function segmentIntersections(s1, s2) {
-    var p = s1.a, r = { x: s1.b.x - s1.a.x, y: s1.b.y - s1.a.y };
-    var q = s2.a, spr = { x: s2.b.x - s2.a.x, y: s2.b.y - s2.a.y };
-    var qp = { x: q.x - p.x, y: q.y - p.y };
-
-    // 整数精确谓词（本阶段坐标均为三位小数；理论上必然成立）
+    var p = s1.a, spr1 = { x: s1.b.x - s1.a.x, y: s1.b.y - s1.a.y };
+    var q = s2.a, spr2 = { x: s2.b.x - s2.a.x, y: s2.b.y - s2.a.y };
     var P = { x: asInt1000(p.x), y: asInt1000(p.y) };
-    var R = { x: asInt1000(r.x), y: asInt1000(r.y) };
+    var R = { x: asInt1000(spr1.x), y: asInt1000(spr1.y) };
     var Q = { x: asInt1000(q.x), y: asInt1000(q.y) };
-    var S = { x: asInt1000(spr.x), y: asInt1000(spr.y) };
+    var S = { x: asInt1000(spr2.x), y: asInt1000(spr2.y) };
     var exact = P.x !== null && R.x !== null && Q.x !== null && S.x !== null &&
                 P.y !== null && R.y !== null && Q.y !== null && S.y !== null;
+    if (!exact) return segmentIntersectionsFloat(s1, s2);
 
-    var crossRS, crossQP, crossQPR;
-    if (exact) {
-      var QP = { x: Q.x - P.x, y: Q.y - P.y };
-      crossRS = R.x * S.y - R.y * S.x;
-      crossQP = QP.x * S.y - QP.y * S.x;
-      crossQPR = QP.x * R.y - QP.y * R.x;
-    } else {
-      crossRS = r.x * spr.y - r.y * spr.x;
-      crossQP = qp.x * spr.y - qp.y * spr.x;
-      crossQPR = qp.x * r.y - qp.y * r.x;
-    }
+    var Pn = { x: BigInt(P.x), y: BigInt(P.y) };
+    var Rn = { x: BigInt(R.x), y: BigInt(R.y) };
+    var Qn = { x: BigInt(Q.x), y: BigInt(Q.y) };
+    var Sn = { x: BigInt(S.x), y: BigInt(S.y) };
+    var QPn = { x: Qn.x - Pn.x, y: Qn.y - Pn.y };
+    var crossRS = Rn.x * Sn.y - Rn.y * Sn.x;
+    var crossQP = QPn.x * Sn.y - QPn.y * Sn.x;
+    var crossQPR = QPn.x * Rn.y - QPn.y * Rn.x;
 
-    if (crossRS !== 0) {
-      // 非平行：t = (q-p)×s / (r×s) ∈ [0,1]，u = (q-p)×r / (r×s) ∈ [0,1]
-      var inRange;
-      if (exact) {
-        inRange = (crossQP === 0 || sameSign(crossQP, crossRS)) &&
-          Math.abs(crossQP) <= Math.abs(crossRS) &&
-          (crossQPR === 0 || sameSign(crossQPR, crossRS)) &&
-          Math.abs(crossQPR) <= Math.abs(crossRS);
-      } else {
-        var tol = EPS * Math.max(1, Math.abs(crossRS));
-        inRange = Math.abs(crossQP) <= Math.abs(crossRS) + tol &&
-                  Math.abs(crossQPR) <= Math.abs(crossRS) + tol &&
-                  (crossQP === 0 || sameSign(crossQP, crossRS)) &&
-                  (crossQPR === 0 || sameSign(crossQPR, crossRS));
-      }
+    if (crossRS !== 0n) {
+      // 非平行：t = (q-p)×s / (r×s) ∈ [0,1]，u 同理；整数谓词精确无容差
+      var inRange = bigAbs(crossQP) <= bigAbs(crossRS) &&
+        bigAbs(crossQPR) <= bigAbs(crossRS) &&
+        (crossQP === 0n || sameSignBig(crossQP, crossRS)) &&
+        (crossQPR === 0n || sameSignBig(crossQPR, crossRS));
       if (!inRange) return [];
-      var t = crossQP / crossRS;
-      return [{ x: p.x + r.x * t, y: p.y + r.y * t }];
+      var den = crossRS, tn = crossQP;
+      var xn = Pn.x * den + Rn.x * tn;
+      var yn = Pn.y * den + Rn.y * tn;
+      var ex = exactPoint(xn, yn, den); // 内部统一把分母变正并约分
+      return [{ x: exactX({ exact: ex }), y: exactY({ exact: ex }), exact: ex }];
     }
 
     // 平行：不共线则无交点
-    if (crossQPR !== 0) return [];
+    if (crossQPR !== 0n) return [];
 
-    // 共线：把端点投影到 s1 方向。整数情形比较整数投影，精确无容差。
-    var pt0, pt1;
-    if (exact) {
-      var d = R.x * R.x + R.y * R.y;
-      var e0 = (Q.x - P.x) * R.x + (Q.y - P.y) * R.y;
-      var e1 = e0 + S.x * R.x + S.y * R.y;
-      var lo = Math.max(0, Math.min(e0, e1));
-      var hi = Math.min(d, Math.max(e0, e1));
-      if (lo > hi) return [];
-      pt0 = projectionPoint(lo, d, p, r, s2, e0, e1, q, spr);
-      if (hi === lo) return [pt0];
-      pt1 = projectionPoint(hi, d, p, r, s2, e0, e1, q, spr);
-      return [pt0, pt1];
+    // 共线：把端点投影到 s1 方向（千分之一整数点积），精确无容差
+    var d = Rn.x * Rn.x + Rn.y * Rn.y;
+    var e0 = QPn.x * Rn.x + QPn.y * Rn.y;
+    var e1 = e0 + Sn.x * Rn.x + Sn.y * Rn.y;
+    var lo = maxBig(0n, minBig(e0, e1));
+    var hi = minBig(d, maxBig(e0, e1));
+    if (lo > hi) return [];
+
+    function collinearPoint(k) {
+      // k 落在哪个原端点上就复用哪个端点（精确恒等去重的关键）
+      var exA1 = s1.exA || exactFromMilli(p.x, p.y);
+      var exB1 = s1.exB || exactFromMilli(s1.b.x, s1.b.y);
+      var exA2 = s2.exA || exactFromMilli(q.x, q.y);
+      var exB2 = s2.exB || exactFromMilli(s2.b.x, s2.b.y);
+      if (k === 0n) return { x: p.x, y: p.y, exact: exA1 };
+      if (k === d) return { x: s1.b.x, y: s1.b.y, exact: exB1 };
+      if (k === e0) return { x: q.x, y: q.y, exact: exA2 };
+      if (k === e1) return { x: s2.b.x, y: s2.b.y, exact: exB2 };
+      var ex2 = exactPoint(Pn.x * d + Rn.x * k, Pn.y * d + Rn.y * k, d);
+      return { x: exactX({ exact: ex2 }), y: exactY({ exact: ex2 }), exact: ex2 };
     }
+
+    var pt0 = collinearPoint(lo);
+    if (hi === lo) return [pt0];
+    return [pt0, collinearPoint(hi)];
+  }
+
+  function bigAbs(a) { return a < 0n ? -a : a; }
+  function sameSignBig(a, b) { return (a > 0n && b > 0n) || (a < 0n && b < 0n); }
+  function minBig(a, b) { return a < b ? a : b; }
+  function maxBig(a, b) { return a > b ? a : b; }
+
+  // 非三位小数坐标的理论兜底（正常草稿不会走到）：浮点求交，无精确表示
+  function segmentIntersectionsFloat(s1, s2) {
+    var p = s1.a, r = { x: s1.b.x - s1.a.x, y: s1.b.y - s1.a.y };
+    var q = s2.a, spr = { x: s2.b.x - s2.a.x, y: s2.b.y - s2.a.y };
+    var qp = { x: q.x - p.x, y: q.y - p.y };
+    var crossRS = r.x * spr.y - r.y * spr.x;
+    var crossQP = qp.x * spr.y - qp.y * spr.x;
+    var crossQPR = qp.x * r.y - qp.y * r.x;
+
+    if (crossRS !== 0) {
+      var tol = EPS * Math.max(1, Math.abs(crossRS));
+      var inRange = Math.abs(crossQP) <= Math.abs(crossRS) + tol &&
+                    Math.abs(crossQPR) <= Math.abs(crossRS) + tol &&
+                    (crossQP === 0 || (crossQP > 0) === (crossRS > 0)) &&
+                    (crossQPR === 0 || (crossQPR > 0) === (crossRS > 0));
+      if (!inRange) return [];
+      var t = crossQP / crossRS;
+      return [{ x: p.x + r.x * t, y: p.y + r.y * t, exact: null }];
+    }
+    if (crossQPR !== 0) return [];
 
     var rlen2 = r.x * r.x + r.y * r.y;
     var t0 = (qp.x * r.x + qp.y * r.y) / rlen2;
@@ -598,43 +882,11 @@
     var flo = Math.max(0, Math.min(t0, t1));
     var fhi = Math.min(1, Math.max(t0, t1));
     if (flo > fhi) return [];
-    var out = [{ x: p.x + r.x * flo, y: p.y + r.y * flo }];
+    var out = [{ x: p.x + r.x * flo, y: p.y + r.y * flo, exact: null }];
     if (fhi - flo > EPS / Math.sqrt(rlen2)) {
-      out.push({ x: p.x + r.x * fhi, y: p.y + r.y * fhi });
+      out.push({ x: p.x + r.x * fhi, y: p.y + r.y * fhi, exact: null });
     }
     return out;
-  }
-
-  function sameSign(a, b) { return (a > 0 && b > 0) || (a < 0 && b < 0); }
-
-  // 共线重叠边界：整数投影 k 落在哪个原端点上就复用该端点（保证同点归一精确）
-  function projectionPoint(k, d, p, r, s2, e0, e1, q, spr) {
-    if (k === 0) return { x: p.x, y: p.y };
-    if (k === d) return { x: p.x + r.x, y: p.y + r.y };
-    if (k === e0) return { x: q.x, y: q.y };
-    if (k === e1) return { x: q.x + spr.x, y: q.y + spr.y };
-    var t = k / d;
-    return { x: p.x + r.x * t, y: p.y + r.y * t };
-  }
-
-  // 点是否落在线段上：三位小数坐标用整数谓词精确判定，否则用欧氏距离 tol
-  function pointOnSegment(p, s, tol) {
-    var a = s.a, b = s.b;
-    var px = asInt1000(p.x), py = asInt1000(p.y);
-    var ax = asInt1000(a.x), ay = asInt1000(a.y);
-    var bx = asInt1000(b.x), by = asInt1000(b.y);
-    if (px !== null && py !== null && ax !== null && ay !== null && bx !== null && by !== null) {
-      var dx = bx - ax, dy = by - ay;
-      if (dx * (py - ay) - dy * (px - ax) !== 0) return false;
-      var dot = (px - ax) * dx + (py - ay) * dy;
-      return dot >= 0 && dot <= dx * dx + dy * dy;
-    }
-    var fx = b.x - a.x, fy = b.y - a.y;
-    var ab = Math.sqrt(fx * fx + fy * fy);
-    if (ab === 0) return dist(p.x, p.y, a.x, a.y) <= tol;
-    if (Math.abs(fx * (p.y - a.y) - fy * (p.x - a.x)) / ab > tol) return false;
-    var proj = ((p.x - a.x) * fx + (p.y - a.y) * fy) / ab;
-    return proj >= -tol && proj <= ab + tol;
   }
 
   // ---------------------------------------------------------------- 图：路径提取
@@ -754,9 +1006,13 @@
     ring = ring.slice(minPos).concat(ring.slice(0, minPos));
     ringEdges = ringEdges.slice(minPos).concat(ringEdges.slice(0, minPos));
 
-    // 逆时针：从最小节点出发，面积应为正（y 向上，CCW 为正）
-    var area = signedArea(ring.concat([ring[0]]), nodesArr);
-    if (area < 0) {
+    // 逆时针：从最小节点出发，精确面积应为正（y 向上，CCW 为正）；
+    // 精确表示缺失时退回浮点符号。小环的浮点符号在平移后并不可靠，
+    // 这正是面积走 BigInt 精确路径的原因。
+    var ringSeq = ring.concat([ring[0]]);
+    var exactSign = exactRingArea(ringSeq, nodesArr);
+    var orientation = exactSign ? exactSign.sign() : Math.sign(signedArea(ringSeq, nodesArr));
+    if (orientation < 0) {
       // 保持最小节点在首位，反转其余访问顺序：
       // [m,a,b,...,z] -> [m,z,...,b,a]；边序列整体反转
       ring = [ring[0]].concat(ring.slice(1).reverse());
@@ -789,6 +1045,8 @@
     repair: repair,
     // 供测试直接调用
     _segmentIntersections: segmentIntersections,
-    _signedArea: signedArea
+    _signedArea: signedArea,
+    _PointIndex: PointIndex,
+    _exactPoint: function (xn, yn, d) { return exactPoint(BigInt(xn), BigInt(yn), BigInt(d)); }
   };
 });
