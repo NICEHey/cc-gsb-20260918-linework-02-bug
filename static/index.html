@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>线稿拓扑修复与路径提取工作台</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="toolbar">
+  <div class="brand">线稿拓扑工作台</div>
+
+  <div class="group">
+    <label class="field">名称
+      <input id="draftName" type="text" maxlength="80" spellcheck="false">
+    </label>
+    <label class="field">吸附距离
+      <input id="snapDistance" type="number" min="0" max="10" step="0.001" style="width:5.5em">
+    </label>
+  </div>
+
+  <div class="group">
+    <select id="caseSelect" title="选择 fixtures/cases.json 中的样例"></select>
+    <button id="btnLoadCase" type="button">载入样例</button>
+    <button id="btnRepair" type="button" class="primary">执行修复</button>
+  </div>
+
+  <div class="group">
+    <label class="chk"><input id="layerOriginal" type="checkbox" checked> 原图</label>
+    <label class="chk"><input id="layerRepaired" type="checkbox" checked> 修复图</label>
+    <button id="btnFit" type="button">适配视图</button>
+    <button id="btnZoomIn" type="button">＋</button>
+    <button id="btnZoomOut" type="button">－</button>
+  </div>
+
+  <div class="group">
+    <button id="btnUndo" type="button" disabled>撤销</button>
+    <button id="btnRedo" type="button" disabled>重做</button>
+    <button id="btnImport" type="button">导入草稿</button>
+    <button id="btnExportDraft" type="button">导出草稿</button>
+    <button id="btnExportTopo" type="button" disabled>导出 topology.json</button>
+    <input id="fileInput" type="file" accept=".json,application/json" hidden>
+  </div>
+
+  <div id="statusPill" class="pill stale">未修复</div>
+</header>
+
+<main class="layout">
+  <!-- 左：线段表 -->
+  <section class="panel segments-panel">
+    <div class="panel-head">
+      <h2>线段表 <span id="segCount" class="muted"></span></h2>
+      <button id="btnAddSeg" type="button" class="small">＋ 新增线段</button>
+    </div>
+    <div class="table-wrap">
+      <table id="segTable">
+        <thead>
+          <tr>
+            <th class="c-enable">启用</th>
+            <th class="c-id">ID</th>
+            <th class="c-coord">a.x</th>
+            <th class="c-coord">a.y</th>
+            <th class="c-coord">b.x</th>
+            <th class="c-coord">b.y</th>
+            <th class="c-del"></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="importErrors" class="errors hidden"></div>
+    <div class="panel-foot muted">
+      坐标：x 向右、y 向上；禁用线段保留在草稿但不参与计算。修改后修复结果立即过期。
+    </div>
+  </section>
+
+  <!-- 中：画布 -->
+  <section class="panel canvas-panel">
+    <div class="canvas-wrap">
+      <canvas id="canvas"></canvas>
+      <div id="coordReadout" class="readout"></div>
+      <div id="legend" class="legend">
+        <span><i class="sw orig"></i>原始线段</span>        <span><i class="sw dis"></i>禁用</span>
+        <span><i class="sw edge"></i>修复边</span>
+        <span><i class="sw ov"></i>重叠边（多来源）</span>
+        <span><i class="sw end"></i>度1 端点</span>
+        <span><i class="sw junc"></i>度&gt;2 分叉</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右：拓扑检查 + 路径 -->
+  <section class="panel side-panel">
+    <div class="panel-head"><h2>拓扑检查</h2></div>
+    <div id="summary" class="summary-grid"></div>
+    <div class="issues-wrap">
+      <h3>问题列表</h3>
+      <ul id="issueList" class="issue-list"></ul>
+    </div>
+    <div class="paths-wrap">
+      <h3>路径列表</h3>
+      <ul id="pathList" class="path-list"></ul>
+    </div>
+  </section>
+</main>
+
+<script src="topology.js"></script>
+<script src="workbench.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
